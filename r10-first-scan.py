@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-VERSION = "0.6.0"
+VERSION = "0.6.1"
 
 SECTOR_SIZE = 512
 TRANSFER_DISK_OFFSET = 0x96A00
@@ -207,16 +207,61 @@ def is_mailbox_lun(device):
     return ident.startswith(b"CANON   ") and ident[8:24].rstrip(b" \x00") == b"R10"
 
 
+def is_windows_r10_lun(device):
+    """Read-only fallback for mailbox LUN discovery after Type-2 overwrote +0x1c.
+
+    The Windows LUN is the vfat/ONTOUCHLITE volume. The Mac LUN is HFS+.
+    We use lsblk metadata only; this does not mount or write either LUN.
+    """
+    try:
+        p = subprocess.run(
+            ["lsblk", "-nrpo", "NAME,FSTYPE,LABEL", device],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return False
+    if p.returncode != 0:
+        return False
+    for line in p.stdout.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 2:
+            continue
+        fstype = parts[1].lower()
+        label = parts[2].strip() if len(parts) >= 3 else ""
+        if fstype in {"vfat", "fat", "fat16", "fat32"} or label.upper() == "ONTOUCHLITE":
+            return True
+    return False
+
+
 def find_mailbox_lun():
     luns = find_r10_luns()
     if not luns:
         die("No Canon R10 USB LUNs detected")
     print("R10 USB LUNs detected: " + ", ".join(luns))
+
     candidates = [d for d in luns if is_mailbox_lun(d)]
-    if len(candidates) != 1:
-        die(f"Could not uniquely identify Canon mailbox LUN. Candidates: {candidates}")
-    print(f"Mailbox LUN selected: {candidates[0]}")
-    return candidates[0]
+    if len(candidates) == 1:
+        print(f"Mailbox LUN selected by TRANSFER identity: {candidates[0]}")
+        return candidates[0]
+
+    # After any Type-2 transaction, TRANSFER+0x1c contains the most recent
+    # Type-2 payload, so the boot-time CANON/R10 identity is no longer a stable
+    # discriminator. Fall back to the Windows FAT/ONTOUCHLITE LUN identity.
+    fat_candidates = [d for d in luns if is_windows_r10_lun(d)]
+    if len(fat_candidates) == 1:
+        print(
+            "TRANSFER identity unavailable/overwritten; "
+            f"mailbox LUN selected by Windows FAT identity: {fat_candidates[0]}"
+        )
+        return fat_candidates[0]
+
+    die(
+        "Could not uniquely identify Canon mailbox LUN. "
+        f"TRANSFER candidates: {candidates}; Windows FAT candidates: {fat_candidates}"
+    )
 
 
 def device_is_mounted(device):
@@ -494,11 +539,6 @@ class R10Mailbox:
         hexdump(tx.type2, indent="    ")
         print("TYPE-1 CDB:", hexline(cdb))
 
-        # Canon ordering recovered from R10Lite Type-2 path:
-        #   write payload at TRANSFER+0x1c
-        #   write Type-1 command at TRANSFER+0x00
-        #   arm status at TRANSFER+0x18
-        #   poll until firmware changes it
         direct_patch_bytes(
             self.device,
             TRANSFER_DISK_OFFSET + TYPE2_OFFSET,
@@ -601,7 +641,7 @@ def post_experiment_snapshot(mb, label):
 def print_dry_run(live):
     setwins, runtime = default_setwindow_transactions(live["inquiry_ex"])
     print("\n" + "=" * 76)
-    print("R10 v0.6 DEFAULT STARTSCAN DRY RUN")
+    print("R10 v0.6.1 DEFAULT STARTSCAN DRY RUN")
     print("=" * 76)
     print(f"e90={runtime['e90']} e94={runtime['e94']}")
     for tx in setwins + default_define_mode_transactions():
@@ -636,7 +676,7 @@ def run_setwindow_experiment(mb, live):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Canon imageFORMULA R10 Linux mailbox probe / controlled v0.6 experiment"
+        description="Canon imageFORMULA R10 Linux mailbox probe / controlled v0.6.1 experiment"
     )
     parser.add_argument("--diagnostic", action="store_true", help="run safe initialization")
     parser.add_argument("--dry-run", action="store_true", help="compile default SetWindow/DefineScanMode transcript")
@@ -656,19 +696,13 @@ def main():
 
     print(f"Canon imageFORMULA R10 Linux probe v{VERSION}")
     print("Generic configuration/motion execution remains disabled.")
-    print("v0.6 adds one narrow active path: --experiment-setwindow.")
+    print("v0.6.1 retains the narrow active path: --experiment-setwindow.")
 
     device = find_mailbox_lun()
     print(f"\nDevice: {device}")
     if device_is_mounted(device):
         die(f"{device} or a child partition is mounted. Unmount scanner filesystem first.")
     print("Scanner filesystem: unmounted")
-
-    identity = read_identity(device)
-    if not (identity.startswith(b"CANON   ") and identity[8:24].rstrip(b" \x00") == b"R10"):
-        die("Mailbox identity verification failed")
-    revision = identity[24:28].split(b"\x00")[0].decode(errors="replace")
-    print(f"Verified: CANON R10 firmware {revision}")
 
     mb = R10Mailbox(device)
     print("Initial mailbox status: " + hexline(mb.status()))
