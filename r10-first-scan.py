@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 
 SECTOR_SIZE = 512
 TRANSFER_DISK_OFFSET = 0x96A00
@@ -18,16 +18,12 @@ INDATA_DISK_OFFSET = 0x296A00
 TRANSFER_SECTOR = TRANSFER_DISK_OFFSET // SECTOR_SIZE
 
 STATUS_OFFSET = 0x18
+TYPE2_OFFSET = 0x1C
 IDENTITY_OFFSET = 0x1C
-
-# ===========================================================================
-# HARD EXECUTION INTERLOCKS
-# ===========================================================================
 
 BLOCKED_EXECUTION_OPCODES = {
     0x15: "MODE SELECT / UNRESOLVED CONFIG",
     0x1B: "SCAN",
-    0x24: "SET WINDOW",
     0x2A: "WRITE / UNRESOLVED CONFIG",
     0x31: "OBJECT POSITION",
     0xD6: "DEFINE SCAN MODE",
@@ -59,9 +55,6 @@ READ_TABLE_BYTES45 = [
     ]
 ]
 
-# ===========================================================================
-# BASIC HELPERS
-# ===========================================================================
 
 def die(msg):
     print(f"\nERROR: {msg}", file=sys.stderr)
@@ -87,11 +80,7 @@ def be16(value):
 def be24(value):
     if not 0 <= value <= 0xFFFFFF:
         raise ValueError("value does not fit in 24 bits")
-    return bytes([
-        (value >> 16) & 0xFF,
-        (value >> 8) & 0xFF,
-        value & 0xFF,
-    ])
+    return bytes([(value >> 16) & 0xFF, (value >> 8) & 0xFF, value & 0xFF])
 
 
 def be32(value):
@@ -105,21 +94,10 @@ def u16be(data, off):
 def u32be(data, off):
     return int.from_bytes(data[off:off + 4], "big")
 
-# ===========================================================================
-# DIRECT BLOCK I/O
-# ===========================================================================
 
 def direct_read_sector(device, sector):
     p = subprocess.run(
-        [
-            "dd",
-            f"if={device}",
-            "bs=512",
-            f"skip={sector}",
-            "count=1",
-            "iflag=direct",
-            "status=none",
-        ],
+        ["dd", f"if={device}", "bs=512", f"skip={sector}", "count=1", "iflag=direct", "status=none"],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
@@ -141,15 +119,8 @@ def direct_write_sector(device, sector, data):
     try:
         p = subprocess.run(
             [
-                "dd",
-                f"if={temp}",
-                f"of={device}",
-                "bs=512",
-                f"seek={sector}",
-                "count=1",
-                "oflag=direct",
-                "conv=notrunc,fsync",
-                "status=none",
+                "dd", f"if={temp}", f"of={device}", "bs=512", f"seek={sector}", "count=1",
+                "oflag=direct", "conv=notrunc,fsync", "status=none",
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -176,21 +147,22 @@ def direct_read_bytes(device, absolute_offset, length):
     return bytes(result)
 
 
-def patch_sector(device, absolute_offset, payload):
+def direct_patch_bytes(device, absolute_offset, payload):
     if not payload:
         return
-    first_sector = absolute_offset // SECTOR_SIZE
-    last_sector = (absolute_offset + len(payload) - 1) // SECTOR_SIZE
-    if first_sector != last_sector:
-        die("Internal error: patch_sector crosses sector boundary")
-    inside = absolute_offset % SECTOR_SIZE
-    block = bytearray(direct_read_sector(device, first_sector))
-    block[inside:inside + len(payload)] = payload
-    direct_write_sector(device, first_sector, bytes(block))
+    pos = 0
+    remaining = len(payload)
+    while remaining:
+        sector = absolute_offset // SECTOR_SIZE
+        inside = absolute_offset % SECTOR_SIZE
+        take = min(remaining, SECTOR_SIZE - inside)
+        block = bytearray(direct_read_sector(device, sector))
+        block[inside:inside + take] = payload[pos:pos + take]
+        direct_write_sector(device, sector, bytes(block))
+        absolute_offset += take
+        pos += take
+        remaining -= take
 
-# ===========================================================================
-# R10 DISCOVERY
-# ===========================================================================
 
 def usb_parent_has_r10(block_name):
     p = Path("/sys/class/block") / block_name / "device"
@@ -258,9 +230,6 @@ def device_is_mounted(device):
                 return True
     return False
 
-# ===========================================================================
-# TRANSACTION REPRESENTATION
-# ===========================================================================
 
 @dataclass
 class Transaction:
@@ -279,9 +248,6 @@ def make_type1(cdb):
     packet[12:12 + len(cdb)] = cdb
     return bytes(packet)
 
-# ===========================================================================
-# CDB COMPILERS
-# ===========================================================================
 
 def cdb_inquiry():
     return bytes.fromhex("12 00 00 00 40 00")
@@ -313,30 +279,6 @@ def cdb_exec_read(read_type, requested_length):
     cdb[6:9] = be24(requested_length)
     return bytes(cdb)
 
-
-def cdb_object_position(position):
-    mapping = {0: 0x00, 1: 0x01, 2: 0x04}
-    if position not in mapping:
-        raise ValueError("ObjectPosition must be 0, 1 or 2")
-    cdb = bytearray(10)
-    cdb[0] = 0x31
-    cdb[1] = mapping[position]
-    return bytes(cdb)
-
-
-def cdb_get_memory(address, length):
-    if not 0 <= length <= 0x2000:
-        raise ValueError("GetMemory chunk must be <= 0x2000")
-    cdb = bytearray(10)
-    cdb[0] = 0x3B
-    cdb[2:6] = be32(address)
-    cdb[6] = 0
-    cdb[7:9] = be16(length)
-    return bytes(cdb)
-
-# ===========================================================================
-# EXACT SET WINDOW SERIALIZER
-# ===========================================================================
 
 @dataclass
 class ScanWindow:
@@ -376,9 +318,6 @@ def compile_set_window(w, provenance=""):
         proven=True,
     )
 
-# ===========================================================================
-# DEFINE SCAN MODE SERIALIZER
-# ===========================================================================
 
 @dataclass
 class ScanModeParam:
@@ -433,9 +372,6 @@ def compile_define_scan_mode(m, provenance=""):
         proven=True,
     )
 
-# ===========================================================================
-# DEFAULT PROFILE / TRANSCRIPT
-# ===========================================================================
 
 @dataclass
 class DefaultProfile:
@@ -459,42 +395,17 @@ def derive_runtime_values(inquiry_ex):
     y_num = u32be(inquiry_ex, 0x18)
     if x_den == 0 or y_den == 0:
         raise ValueError("InquiryEx denominator is zero")
-    e90 = (x_num * 1200) // x_den
-    e94 = (y_num * 1200) // y_den
     return {
-        "x_den": x_den,
-        "y_den": y_den,
-        "x_num": x_num,
-        "y_num": y_num,
-        "e90": e90,
-        "e94": e94,
+        "e90": (x_num * 1200) // x_den,
+        "e94": (y_num * 1200) // y_den,
     }
 
 
-def compile_default_transcript(state_value, inquiry_ex):
+def default_setwindow_transactions(inquiry_ex):
     profile = DefaultProfile()
     runtime = derive_runtime_values(inquiry_ex)
     y_extent = profile.paper_height + profile.special_y_padding
-
     tx = []
-    tx.append(Transaction(
-        name="DEFAULT PROFILE",
-        note=(
-            "Recovered native default: 200 DPI, LETTER 10200x13200, "
-            "+0x8a4=1 special geometry path, image mode 5, 8 bits."
-        ),
-        proven=True,
-    ))
-    tx.append(Transaction(
-        name="RUNTIME DERIVATION",
-        note=(
-            f"InquiryEx -> e90={runtime['e90']} (0x{runtime['e90']:08x}), "
-            f"e94={runtime['e94']} (0x{runtime['e94']:08x}); "
-            f"state[0:4]=0x{state_value:08x}."
-        ),
-        proven=True,
-    ))
-
     for window_id in (0, 1):
         tx.append(compile_set_window(
             ScanWindow(
@@ -508,116 +419,18 @@ def compile_default_transcript(state_value, inquiry_ex):
                 image_mode=profile.image_mode,
                 bits_per_pixel=profile.bits_per_pixel,
             ),
-            provenance=(
-                "DEFAULT-DERIVED: StartScan uses 200 DPI; +0x8a4=1 "
-                "forces xextent=-472 and yextent=13200+944; ypos=e90 "
-                "from live InquiryEx."
-            ),
+            provenance="Recovered native default StartScan SetWindow transaction.",
         ))
-
-    tx.append(compile_define_scan_mode(
-        ScanModeParam(mode_type=0, p4=0, p5=0, p6=0),
-        provenance=(
-            "DEFAULT-DERIVED: tag +0x38/+0x39/+0x3a are zero."
-        ),
-    ))
-
-    # Default builder values: +0x34=0, +0x30=0, +0x31=0,
-    # +0x8a7=0, +0x8a4=1, +0x3b=0. Runtime +0x8a9 is not
-    # statically knowable, so this packet is only exact if it is zero.
-    tx.append(compile_define_scan_mode(
-        ScanModeParam(mode_type=1, p4=0, p5=0, p6=1, p8=0, p10=0),
-        provenance=(
-            "DEFAULT-DERIVED assuming runtime +0x8a9=0: p4=0, p5=0, "
-            "p6=1 from +0x8a4, p8=0, p10=0. If +0x8a9 becomes 1, "
-            "StartScan forces p4=2 and p10=1."
-        ),
-    ))
-
-    tx.append(compile_define_scan_mode(
-        ScanModeParam(mode_type=2, p4=0, p5=0, p6=0, p7=0),
-        provenance=(
-            "DEFAULT-DERIVED: image mode 5 causes StartScan to zero "
-            "all four type-2 mode bytes."
-        ),
-    ))
-
-    tx.append(Transaction(
-        name="ADJUSTLIGHT",
-        note=(
-            "Control-flow known, but active calibration still contains "
-            "unresolved SAdjustInfo/session values. No calibration packet is emitted."
-        ),
-        proven=False,
-    ))
-
-    tx.append(Transaction(
-        name="SCAN",
-        note=(
-            "Not emitted in v0.5. Scan selectors are intentionally deferred "
-            "until the initialization transcript is validated."
-        ),
-        proven=False,
-    ))
-
     return tx, runtime
 
-# ===========================================================================
-# OUTPUT
-# ===========================================================================
 
-def print_transaction(tx, number):
-    print()
-    print("-" * 76)
-    status = "PROVEN" if tx.proven else "UNRESOLVED"
-    print(f"[{number:03d}] {tx.name} [{status}]")
-    if tx.note:
-        print(f"      {tx.note}")
-    if tx.type1 is not None:
-        print("\nTYPE-1:")
-        hexdump(tx.type1, indent="    ")
-        if len(tx.type1) >= 13:
-            opcode = tx.type1[12]
-            if opcode in BLOCKED_EXECUTION_OPCODES:
-                print(f"    EXECUTION BLOCKED: 0x{opcode:02x} {BLOCKED_EXECUTION_OPCODES[opcode]}")
-    if tx.type2 is not None:
-        print(f"\nTYPE-2 ({len(tx.type2)} bytes):")
-        hexdump(tx.type2, indent="    ")
-        print("    EXECUTION BLOCKED: TYPE-2 transmission disabled")
+def default_define_mode_transactions():
+    return [
+        compile_define_scan_mode(ScanModeParam(mode_type=0, p4=0, p5=0, p6=0)),
+        compile_define_scan_mode(ScanModeParam(mode_type=1, p4=0, p5=0, p6=1, p8=0, p10=0)),
+        compile_define_scan_mode(ScanModeParam(mode_type=2, p4=0, p5=0, p6=0, p7=0)),
+    ]
 
-
-def print_compiled_profile(state_value, inquiry_ex):
-    tx, runtime = compile_default_transcript(state_value, inquiry_ex)
-    print("\n" + "=" * 76)
-    print("R10 v0.5 DEFAULT STARTSCAN DRY-RUN TRANSCRIPT")
-    print("=" * 76)
-    print("\nDEFAULT PROFILE")
-    print("  Resolution: 200 x 200 DPI")
-    print("  Paper:      LETTER (10200 x 13200 internal units)")
-    print("  Window IDs: 0 then 1")
-    print("  Mode/bits:  5 / 8")
-    print("\nLIVE-DERIVED")
-    print(f"  e90:        {runtime['e90']} (0x{runtime['e90']:08x})")
-    print(f"  e94:        {runtime['e94']} (0x{runtime['e94']:08x})")
-    print(f"  state dword: 0x{state_value:08x}")
-    print("\nSAFETY")
-    print("  No SET WINDOW, DEFINE SCAN MODE, SCAN, OBJECT POSITION,")
-    print("  SET ADJUST DATA, 0x15, 0x2a, or TYPE-2 packet can be transmitted.")
-    for i, item in enumerate(tx, 1):
-        print_transaction(item, i)
-    unresolved = [x for x in tx if not x.proven]
-    print("\n" + "=" * 76)
-    print("UNRESOLVED SUMMARY")
-    print("=" * 76)
-    for item in unresolved:
-        print(f"  - {item.name}: {item.note}")
-    print(f"\nTransactions/markers: {len(tx)}")
-    print(f"Unresolved markers:   {len(unresolved)}")
-    print("\nEND DRY RUN")
-
-# ===========================================================================
-# SAFE MAILBOX EXECUTOR
-# ===========================================================================
 
 class R10Mailbox:
     def __init__(self, device):
@@ -634,26 +447,7 @@ class R10Mailbox:
     def read_indata(self, length):
         return direct_read_bytes(self.device, INDATA_DISK_OFFSET, length)
 
-    def send_type1(self, cdb, wait=None, timeout=10.0):
-        opcode = cdb[0]
-        if opcode in BLOCKED_EXECUTION_OPCODES:
-            die(
-                "EXECUTION SAFETY INTERLOCK: refusing "
-                f"opcode 0x{opcode:02x} ({BLOCKED_EXECUTION_OPCODES[opcode]})"
-            )
-        if wait is None:
-            wait = opcode not in TYPE1_NO_WAIT
-        packet = make_type1(cdb)
-        print("\nTYPE-1 CDB:", hexline(cdb))
-        patch_sector(self.device, TRANSFER_DISK_OFFSET, packet)
-        if not wait:
-            print("No response wait required.")
-            return 0
-        patch_sector(
-            self.device,
-            TRANSFER_DISK_OFFSET + STATUS_OFFSET,
-            b"\xff\xff\xff\xff",
-        )
+    def poll_status(self, timeout=10.0):
         deadline = time.monotonic() + timeout
         while True:
             raw = self.status()
@@ -665,9 +459,63 @@ class R10Mailbox:
                 die("Mailbox response timeout")
             time.sleep(0.1)
 
-# ===========================================================================
-# SAFE INITIALIZATION
-# ===========================================================================
+    def send_type1(self, cdb, wait=None, timeout=10.0):
+        opcode = cdb[0]
+        if opcode in BLOCKED_EXECUTION_OPCODES or opcode == 0x24:
+            die(
+                "EXECUTION SAFETY INTERLOCK: refusing "
+                f"opcode 0x{opcode:02x}"
+            )
+        if wait is None:
+            wait = opcode not in TYPE1_NO_WAIT
+        print("\nTYPE-1 CDB:", hexline(cdb))
+        direct_patch_bytes(self.device, TRANSFER_DISK_OFFSET, make_type1(cdb))
+        if not wait:
+            print("No response wait required.")
+            return 0
+        direct_patch_bytes(
+            self.device,
+            TRANSFER_DISK_OFFSET + STATUS_OFFSET,
+            b"\xff\xff\xff\xff",
+        )
+        return self.poll_status(timeout=timeout)
+
+    def send_controlled_setwindow(self, tx, timeout=10.0):
+        if tx.type1 is None or tx.type2 is None:
+            die("Internal error: controlled SET WINDOW requires TYPE-1 and TYPE-2")
+        cdb = tx.type1[12:22]
+        if not cdb or cdb[0] != 0x24:
+            die("Internal error: controlled path only permits opcode 0x24")
+        if len(tx.type2) != 64:
+            die("Internal error: SET WINDOW Type-2 must be exactly 64 bytes")
+
+        print(f"\nCONTROLLED TRANSACTION: {tx.name}")
+        print("TYPE-2 payload:")
+        hexdump(tx.type2, indent="    ")
+        print("TYPE-1 CDB:", hexline(cdb))
+
+        # Canon ordering recovered from R10Lite Type-2 path:
+        #   write payload at TRANSFER+0x1c
+        #   write Type-1 command at TRANSFER+0x00
+        #   arm status at TRANSFER+0x18
+        #   poll until firmware changes it
+        direct_patch_bytes(
+            self.device,
+            TRANSFER_DISK_OFFSET + TYPE2_OFFSET,
+            tx.type2,
+        )
+        direct_patch_bytes(
+            self.device,
+            TRANSFER_DISK_OFFSET,
+            tx.type1,
+        )
+        direct_patch_bytes(
+            self.device,
+            TRANSFER_DISK_OFFSET + STATUS_OFFSET,
+            b"\xff\xff\xff\xff",
+        )
+        return self.poll_status(timeout=timeout)
+
 
 def safe_initialization(mb):
     print("\n" + "=" * 76)
@@ -702,14 +550,11 @@ def safe_initialization(mb):
     inquiry_ex = mb.read_indata(48)
     print("INQUIRY EX:")
     hexdump(inquiry_ex)
-    try:
-        runtime = derive_runtime_values(inquiry_ex)
-        print(
-            f"Derived e90={runtime['e90']} (0x{runtime['e90']:08x}), "
-            f"e94={runtime['e94']} (0x{runtime['e94']:08x})"
-        )
-    except ValueError as exc:
-        die(f"InquiryEx runtime derivation failed: {exc}")
+    runtime = derive_runtime_values(inquiry_ex)
+    print(
+        f"Derived e90={runtime['e90']} (0x{runtime['e90']:08x}), "
+        f"e94={runtime['e94']} (0x{runtime['e94']:08x})"
+    )
 
     print("\n[5] STARTSCAN STATE READ")
     cdb = cdb_exec_read(6, 0x80)
@@ -732,28 +577,86 @@ def safe_initialization(mb):
         "state_value": state_value,
     }
 
-# ===========================================================================
-# MAIN
-# ===========================================================================
+
+def post_experiment_snapshot(mb, label):
+    print("\n" + "=" * 76)
+    print(f"POST-EXPERIMENT SNAPSHOT: {label}")
+    print("=" * 76)
+
+    print("\nREQUEST SENSE")
+    status = mb.send_type1(cdb_request_sense(), wait=True)
+    if status:
+        print(f"REQUEST SENSE mailbox status: 0x{status:08x}")
+    sense = mb.read_indata(14)
+    hexdump(sense)
+
+    print("\nSTATE READ")
+    status = mb.send_type1(cdb_exec_read(6, 0x80), wait=True)
+    if status:
+        print(f"STATE READ mailbox status: 0x{status:08x}")
+    state = mb.read_indata(128)
+    hexdump(state)
+
+
+def print_dry_run(live):
+    setwins, runtime = default_setwindow_transactions(live["inquiry_ex"])
+    print("\n" + "=" * 76)
+    print("R10 v0.6 DEFAULT STARTSCAN DRY RUN")
+    print("=" * 76)
+    print(f"e90={runtime['e90']} e94={runtime['e94']}")
+    for tx in setwins + default_define_mode_transactions():
+        print(f"\n{tx.name}")
+        print("TYPE-1:")
+        hexdump(tx.type1, indent="    ")
+        print("TYPE-2:")
+        hexdump(tx.type2, indent="    ")
+    print("\nNo configuration transaction was transmitted.")
+
+
+def run_setwindow_experiment(mb, live):
+    txs, runtime = default_setwindow_transactions(live["inquiry_ex"])
+
+    print("\n" + "=" * 76)
+    print("CONTROLLED SET WINDOW EXPERIMENT")
+    print("=" * 76)
+    print("This path can transmit ONLY the two recovered default opcode 0x24 packets.")
+    print("SCAN, DEFINE SCAN MODE, positioning, calibration and generic unsafe execution remain blocked.")
+    print(f"Live e90={runtime['e90']} (0x{runtime['e90']:08x})")
+
+    for tx in txs:
+        status = mb.send_controlled_setwindow(tx)
+        if status != 0:
+            print(f"{tx.name} returned nonzero mailbox status 0x{status:08x}; stopping experiment.")
+            post_experiment_snapshot(mb, tx.name)
+            return
+
+    post_experiment_snapshot(mb, "both SET WINDOW commands accepted")
+    print("\nSET WINDOW experiment complete. No SCAN or motor command was sent.")
+
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Canon imageFORMULA R10 Linux mailbox probe / v0.5 dry-run transcript"
+        description="Canon imageFORMULA R10 Linux mailbox probe / controlled v0.6 experiment"
     )
     parser.add_argument("--diagnostic", action="store_true", help="run safe initialization")
+    parser.add_argument("--dry-run", action="store_true", help="compile default SetWindow/DefineScanMode transcript")
     parser.add_argument(
-        "--dry-run",
+        "--experiment-setwindow",
         action="store_true",
-        help="run safe initialization then compile the recovered default StartScan transcript",
+        help="transmit only the two recovered default SET WINDOW transactions, then stop",
     )
     args = parser.parse_args()
 
     if os.geteuid() != 0:
         die("Run with sudo")
 
+    selected = sum(bool(x) for x in (args.diagnostic, args.dry_run, args.experiment_setwindow))
+    if selected > 1:
+        die("Choose only one of --diagnostic, --dry-run, or --experiment-setwindow")
+
     print(f"Canon imageFORMULA R10 Linux probe v{VERSION}")
-    print("CONFIGURATION AND MOTION EXECUTION ARE DISABLED.")
-    print("TYPE-2 TRANSMISSION IS NOT IMPLEMENTED.")
+    print("Generic configuration/motion execution remains disabled.")
+    print("v0.6 adds one narrow active path: --experiment-setwindow.")
 
     device = find_mailbox_lun()
     print(f"\nDevice: {device}")
@@ -770,19 +673,22 @@ def main():
     mb = R10Mailbox(device)
     print("Initial mailbox status: " + hexline(mb.status()))
 
-    if not args.diagnostic and not args.dry_run:
-        print("\nNo commands sent.\n\nSafe options:\n  --diagnostic\n  --dry-run")
+    if selected == 0:
+        print("\nNo commands sent.\n")
+        print("Options:")
+        print("  --diagnostic")
+        print("  --dry-run")
+        print("  --experiment-setwindow")
         return
 
     live = safe_initialization(mb)
+
     if args.dry_run:
-        print_compiled_profile(live["state_value"], live["inquiry_ex"])
+        print_dry_run(live)
+    elif args.experiment_setwindow:
+        run_setwindow_experiment(mb, live)
 
     print(f"\nv{VERSION} complete.")
-    print(
-        "No SET WINDOW, DEFINE SCAN MODE, SCAN, OBJECT POSITION, SET ADJUST DATA, "
-        "0x15, 0x2a, or TYPE-2 transaction was transmitted."
-    )
 
 
 if __name__ == "__main__":
