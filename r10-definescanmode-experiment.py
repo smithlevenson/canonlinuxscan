@@ -18,9 +18,6 @@ spec.loader.exec_module(r10)
 
 VERSION = "0.6.1"
 
-# Exact Type-2 bodies produced by the recovered default profile. These constants
-# are an additional interlock: the experiment refuses a compiler result that
-# differs from the transcript validated in v0.5.
 EXPECTED_DEFINE_TYPE2 = (
     bytes.fromhex(
         "00 00 00 1c 00 02 b0 00 00 00 00 00 30 0e 00 00 "
@@ -53,7 +50,6 @@ def send_controlled_define(mb, tx, expected_type2, index, timeout=10.0):
     r10.hexdump(tx.type2, indent="    ")
     print("TYPE-1 CDB:", r10.hexline(cdb))
 
-    # Same Canon Type-2 ordering validated by the live v0.6 SET WINDOW run.
     r10.direct_patch_bytes(
         mb.device,
         r10.TRANSFER_DISK_OFFSET + r10.TYPE2_OFFSET,
@@ -82,15 +78,23 @@ def main():
         r10.die(f"{device} or a child partition is mounted. Unmount scanner filesystem first.")
     print("Scanner filesystem: unmounted")
 
-    identity = r10.read_identity(device)
-    if not (identity.startswith(b"CANON   ") and identity[8:24].rstrip(b" \x00") == b"R10"):
-        r10.die("Mailbox identity verification failed")
-    revision = identity[24:28].split(b"\x00")[0].decode(errors="replace")
-    print(f"Verified: CANON R10 firmware {revision}")
-
+    # Do not require the boot-time TRANSFER+0x1c identity here. A successful
+    # Type-2 transaction overwrites that mailbox area by design. Device identity
+    # is instead established by USB VID/PID + the Windows FAT/ONTOUCHLITE LUN,
+    # and the live INQUIRY below verifies CANON/R10/firmware before writes.
     mb = r10.R10Mailbox(device)
     print("Initial mailbox status: " + r10.hexline(mb.status()))
     live = r10.safe_initialization(mb)
+
+    inquiry = live["inquiry"]
+    if not (
+        len(inquiry) >= 36
+        and inquiry[8:16] == b"CANON   "
+        and inquiry[16:32].rstrip(b" \x00") == b"R10"
+    ):
+        r10.die("Live INQUIRY identity verification failed")
+    revision = inquiry[32:36].split(b"\x00")[0].decode(errors="replace")
+    print(f"Verified by live INQUIRY: CANON R10 firmware {revision}")
 
     print("\n" + "=" * 76)
     print("PHASE 1: VALIDATED DEFAULT SET WINDOW")
